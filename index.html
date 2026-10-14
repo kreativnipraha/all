@@ -1,0 +1,1823 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kreativní Praha v městském prostoru</title>
+    <link rel="preconnect" href="https://a.basemaps.cartocdn.com">
+    <link rel="preconnect" href="https://b.basemaps.cartocdn.com">
+    <link rel="preconnect" href="https://c.basemaps.cartocdn.com">
+    <link rel="preconnect" href="https://unpkg.com">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+    <style>
+        :root {
+            --color-core: #2864A6;
+            --color-pulse: #E8318B;
+            --color-data: #7EC8A4;
+            --color-void: #F19C8A;
+            --color-highlight: #F8EC81;
+            --color-river: #7FD8F7;
+            --color-kompas: #F9EC53;
+
+            --dark: #0A1C35;
+            --bg: #F4F5F7;
+
+            --theme-bg: var(--color-core);
+            --theme-fg: var(--color-highlight);
+            --bezier: cubic-bezier(0.19, 1, 0.22, 1);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Theinhardt', Arial, sans-serif; font-weight: 400; font-style: normal; }
+        body, html { height: 100%; overflow: hidden; background: var(--bg); -webkit-font-smoothing: antialiased; }
+
+        /* FIX 2A: GPU promotion on map container */
+        #map {
+            width: 100%; height: 100vh; height: 100dvh; background: var(--bg); cursor: crosshair;
+            touch-action: pan-x pan-y;
+        }
+        body.panel-open #map { cursor: default; }
+
+        .leaflet-control-attribution, .leaflet-control-zoom { display: none !important; }
+
+        /* Leaflet panes: no will-change — GPU promotion causes 1-frame black flash
+           when animated child elements are composited against an uninitialised layer. */
+
+        /* ── FATAL ERROR OVERLAY ──────────────────────────────────────────────── */
+        #error-overlay {
+            display: none;
+            position: fixed; inset: 0; z-index: 9999;
+            background: var(--dark);
+            color: var(--bg);
+            font-family: monospace;
+            padding: 60px 40px;
+            overflow-y: auto;
+        }
+        #error-overlay h1 { font-size: 1.6rem; margin-bottom: 24px; letter-spacing: -0.02em; }
+        #error-overlay ul { list-style: none; margin-bottom: 24px; }
+        #error-overlay ul li { padding: 6px 0; font-size: 0.9rem; opacity: 0.75; }
+        #error-overlay ul li::before { content: '✗ '; color: #E8318B; }
+        #error-overlay ul li.ok::before { content: '✓ '; color: #7FD8F7; }
+        #error-overlay p { font-size: 0.85rem; opacity: 0.5; line-height: 1.6; }
+
+        /* District canvas pane zoom-hiding — applied directly to the pane DOM element.
+           Base transition is set in JS on the element itself after pane creation. */
+        .zoom-hiding {
+            opacity: 0 !important;
+            pointer-events: none !important;
+        }
+
+        .leaflet-marker-icon { background: none; border: none; }
+        .leaflet-marker-icon.custom-cluster { cursor: default !important; }
+        body:not(.is-filtering) .leaflet-marker-icon.custom-cluster:has(.child-node) { cursor: pointer !important; }
+        body.is-filtering .leaflet-marker-icon.custom-cluster:has(.child-node.is-active-category) { cursor: pointer !important; }
+        /* FIX: explicitly transparent bg on all div-icon containers.
+           Leaflet's default .leaflet-div-icon has background:white + border.
+           The !important here overrides any Leaflet stylesheet specificity.
+           Without this, subpixel anti-aliasing composites the colored dot
+           against white (or worse, the uninitialized black GPU layer). */
+        .leaflet-div-icon { background: transparent !important; border: none !important; }
+        .custom-cluster { background: transparent !important; border: none !important; overflow: visible; }
+
+        /* ── MARKER SYSTEM ─────────────────────────────────────────────────────────
+           All animation rings (.sonar-ring, .pulse-ring) use ONLY opacity + transform.
+           No z-index: negative values anywhere. No pseudo-elements. No isolation.
+           No translateZ(0). Rings sit in normal stacking order: ring → sonar → pulse → core.
+           Animations driven by Web Animations API in JS — zero CSS keyframe toggling.   */
+
+        .marker-wrapper {
+            position: relative; width: 48px; height: 48px;
+            display: flex; align-items: center; justify-content: center;
+            overflow: visible;
+            /* FIX: transparent prevents Leaflet's default white div-icon bg from
+               showing as a black pixel under GPU compositing */
+            background: transparent;
+            transition: opacity 0.4s var(--bezier);
+        }
+
+        .child-node {
+            position: absolute; width: 48px; height: 48px;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer;
+            overflow: visible;
+            /* FIX: transparent bg prevents GPU layer black-fill on promotion.
+               isolation:isolate ensures this node's z-index stacking context
+               is self-contained — prevents bleeding into adjacent marker layers.
+               will-change:transform pre-allocates the GPU layer so that applying
+               scale(1.3) via is-active-category class doesn't trigger a new
+               layer promotion (and its 1-frame black initialisation) at paint time. */
+            background: transparent;
+            isolation: isolate;
+            will-change: transform;
+            transition: opacity 0.5s var(--bezier), transform 0.5s var(--bezier);
+        }
+
+        /* Stacking order inside .child-node (all positive, all siblings):
+           .node-ring   — z-index: 1  (outermost, decorative border ring)
+           .sonar-ring  — z-index: 2  (expanding sonar, behind core)
+           .pulse-ring  — z-index: 3  (ambient idle pulse, behind core)
+           .node-core   — z-index: 4  (the filled dot, always on top)        */
+
+        .node-ring {
+            position: absolute; width: 32px; height: 32px;
+            border: 2px solid var(--cat-color); border-radius: 50%;
+            opacity: 0.35; z-index: 1;
+            /* FIX: will-change pre-allocates GPU layer for both animated properties,
+               preventing the 1-frame black fill when layer promotion happens mid-transition */
+            will-change: transform, opacity;
+            transition: transform 0.4s var(--bezier), opacity 0.4s var(--bezier),
+                        border-width 0.4s var(--bezier), width 0.4s var(--bezier),
+                        height 0.4s var(--bezier);
+        }
+
+        .sonar-ring, .pulse-ring {
+            position: absolute;
+            top: 50%; left: 50%;
+            width: 14px; height: 14px;
+            border-radius: 50%;
+            background: var(--cat-color);
+            /* FIX: explicit initial transform prevents subpixel black-edge artifact.
+               Using translate3d forces a GPU compositing layer immediately so the
+               browser never has to promote it on-demand (which causes 1-frame black flash). */
+            transform: translate3d(-50%, -50%, 0) scale(1);
+            opacity: 0;
+            pointer-events: none;
+            /* Pre-allocate compositor layer for both animated properties.
+               Without this the browser creates the layer mid-animation,
+               filling it with black before the first painted frame lands. */
+            will-change: transform, opacity;
+        }
+        .sonar-ring { z-index: 2; }
+        .pulse-ring  { z-index: 3; }
+
+        .node-core {
+            position: relative; width: 14px; height: 14px;
+            background: var(--cat-color); border-radius: 50%;
+            z-index: 4;
+            transition: transform 0.4s var(--bezier);
+            /* Pre-allocate GPU layer: prevents black-fill flash when scale
+               animation forces compositor layer creation mid-render */
+            will-change: transform;
+        }
+
+        .child-node.cat-core .node-ring {
+            width: 22px; height: 22px; border-width: 1.5px; opacity: 0.22;
+        }
+        .child-node.cat-core .node-core {
+            width: 8px; height: 8px;
+        }
+
+        @media (hover: hover) and (pointer: fine) {
+            .child-node:hover { z-index: 100 !important; }
+            .child-node:hover .node-ring  { transform: scale(0.7); opacity: 0.9; border-width: 3px; }
+            .child-node:hover .node-core  { transform: scale(1.4); }
+            .child-node.cat-core:hover .node-ring { transform: scale(0.85); border-width: 2px; }
+            .child-node.cat-core:hover .node-core { transform: scale(1.2); }
+        }
+
+        body.is-filtering .marker-wrapper        { opacity: 0.08; }
+        body.is-filtering .node-ring             { opacity: 0; }
+        body.is-filtering .marker-wrapper:not(.has-active) {
+            cursor: default;
+            pointer-events: none;
+        }
+        body.is-filtering .marker-wrapper:not(.has-active) .child-node {
+            cursor: default;
+            pointer-events: none;
+        }
+
+        body.is-filtering .marker-wrapper.has-active                     { opacity: 1; z-index: 1000 !important; }
+        body.is-filtering .marker-wrapper.has-active .child-node         { opacity: 0.15; pointer-events: none; }
+        body.is-filtering .marker-wrapper.has-active .child-node.is-active-category {
+            opacity: 1; cursor: pointer; pointer-events: all;
+            /* FIX: translateZ(0) forces this to the existing GPU compositor layer
+               instead of promoting a new one. Without it, 200 simultaneous scale()
+               transforms each trigger a new layer allocation → 200 black-fill frames.
+               No z-index here: isolation:isolate on .child-node already creates a
+               self-contained stacking context; a z-index on top of that caused
+               conflicting compositor layer ordering between sibling markers. */
+            transform: translateZ(0) scale(1.3);
+        }
+        body.is-filtering .child-node.is-active-category .node-ring { opacity: 1; transform: scale(1.1); border-width: 2px; }
+
+        .status-ui { position: fixed; bottom: 0; left: 0; width: 100%; height: 12px; background: var(--dark); z-index: 1000; transition: background 0.5s var(--bezier); }
+
+        /* ── KREP LOGO ────────────────────────────────────────────────────────────── */
+        .krep-logo {
+            position: fixed;
+            top: 30px;
+            left: 30px;
+            z-index: 1001;
+            pointer-events: none;
+        }
+        .krep-logo a {
+            pointer-events: all;
+            display: block;
+        }
+        .krep-logo img {
+            display: block;
+            height: 70px;
+            width: auto;
+            opacity: 0.92;
+            transition: opacity 0.3s ease;
+        }
+        .krep-logo a:hover img { opacity: 1; }
+        @media (max-width: 768px) {
+            .krep-logo { top: 16px; left: 16px; }
+            .krep-logo img { height: 44px; }
+        }
+
+        .label-overlay { position: fixed; top: 40px; right: 40px; z-index: 1000; text-align: right; pointer-events: none; will-change: opacity; }
+        .category-pill { display: inline-block; background: var(--theme-bg); color: var(--theme-fg); padding: 8px 20px; border-radius: 0px; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 15px; opacity: 0; transform: translateY(10px); transition: opacity 0.5s var(--bezier), transform 0.5s var(--bezier); }
+        .label-overlay h2 { font-size: 44px; letter-spacing: 0; margin: 0; color: #2864A6; opacity: 0; transform: translateY(10px); transition: opacity 0.5s var(--bezier), transform 0.5s var(--bezier); transition-delay: 0.1s;
+            text-shadow: 0 1px 6px rgba(255,255,255,0.55);
+        }
+        .label-overlay.active .category-pill, .label-overlay.active h2 { opacity: 1; transform: translateY(0); }
+        @media (max-width: 768px) { .label-overlay { display: none; } }
+
+        /* SIDE PANEL */
+        .side-panel {
+            position: fixed; top: 0; right: 0; bottom: 0; width: min(100%, 500px); max-width: 500px;
+            background: var(--theme-bg); z-index: 2000; transform: translateX(100%);
+            transition: transform 0.55s cubic-bezier(0.4, 0, 0.2, 1), background-color 0.5s ease;
+            display: flex; flex-direction: column;
+            box-shadow: -20px 0 60px rgba(0,0,0,0.15); overflow-y: auto;
+            will-change: transform;
+            backface-visibility: hidden;
+        }
+        .modal-card {
+            padding: 72px 46px; display: flex; flex-direction: column;
+            gap: 28px; min-height: 100%; position: relative; z-index: 2;
+        }
+        .modal-card .project-link { margin-top: auto; }
+
+        @media (max-width: 768px) {
+            .side-panel { top: auto; bottom: 0; right: 0; left: 0; max-width: 100%; height: 75vh; transform: translateY(100%); border-radius: 0px; box-shadow: 0 -10px 40px rgba(0,0,0,0.15); }
+            .side-panel::before { content: ''; position: absolute; top: 16px; left: 50%; transform: translateX(-50%); width: 48px; height: 5px; border-radius: 0px; background: var(--theme-fg); opacity: 0.3; z-index: 10; }
+            .modal-card { padding: 50px 30px; gap: 30px; }
+            .modal-header h2 { font-size: 2.7rem; }
+            .close-btn { top: 20px; right: 20px; padding: 10px; font-size: 0.7rem; }
+        }
+        .side-panel.active { transform: translateX(0); }
+        @media (max-width: 768px) { .side-panel.active { transform: translateY(0); } }
+
+        .location-line {
+            color: var(--theme-fg);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.18em;
+            opacity: 1;
+            line-height: 1.6;
+            padding-bottom: 24px;
+            border-bottom: 1px solid color-mix(in srgb, var(--theme-fg) 34%, transparent);
+        }
+        .side-panel[data-cat="core"] .location-line,
+        .side-panel[data-cat="data"] .location-line,
+        .side-panel[data-cat="void"] .location-line,
+        .side-panel[data-cat="river"] .location-line,
+        .side-panel[data-cat="kompas"] .location-line {
+            border-bottom-color: color-mix(in srgb, var(--theme-fg) 34%, transparent);
+        }
+
+        .loc-name {
+            font-size: 1.1rem;
+            font-weight: 500;
+            opacity: 1;
+        }
+        .loc-detail,
+        .loc-addr {
+            font-size: 0.8rem;
+            opacity: 0.92;
+        }
+
+        .modal-header { display: flex; flex-direction: column; gap: 0; }
+        .modal-header h2 { color: var(--theme-fg); font-size: 4rem; line-height: 1; letter-spacing: 0; margin-bottom: 22px; text-transform: uppercase; hyphens: none; }
+        .side-panel[data-cat="void"] .modal-header h2 { font-size: 2.8rem; line-height: 0.95; }
+        .modal-header p { color: var(--theme-fg); font-size: 1rem; line-height: 1.55; opacity: 0.96; margin-top: 24px; }
+
+        .kpi-list { display: flex; flex-direction: column; border-top: 2px solid var(--theme-fg); padding-top: 0; }
+        .kpi-row { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; border-bottom: 1px solid color-mix(in srgb, var(--theme-fg) 28%, transparent); }
+        .side-panel[data-cat="core"] .kpi-row,
+        .side-panel[data-cat="data"] .kpi-row,
+        .side-panel[data-cat="void"] .kpi-row,
+        .side-panel[data-cat="river"] .kpi-row,
+        .side-panel[data-cat="kompas"] .kpi-row { border-bottom-color: color-mix(in srgb, var(--theme-fg) 28%, transparent); }
+
+        .mask { overflow: hidden; display: inline-block; }
+        .kpi-label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.15em; color: var(--theme-fg); opacity: 0.92; transform: translateY(110%); transition: transform 0.8s var(--bezier); max-width: 55%; line-height: 1.3; }
+        .kpi-value { font-size: 2.5rem; color: var(--theme-fg); line-height: 0.9; letter-spacing: 0; transform: translateY(110%); transition: transform 0.8s var(--bezier); }
+        .side-panel.active .kpi-value, .side-panel.active .kpi-label { transform: translateY(0); }
+
+        .close-btn { position: absolute; top: 30px; right: 30px; background: none; border: none; color: var(--theme-fg); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.2em; cursor: pointer; opacity: 0.85; transition: 0.3s ease; z-index: 10; padding: 0; }
+        .close-btn:hover { opacity: 1; transform: scale(0.95); }
+
+        @media (min-width: 769px) and (max-height: 720px), (min-width: 769px) and (max-width: 1100px) {
+            .status-ui { height: 8px; }
+            .krep-logo { top: 20px; left: 20px; }
+            .krep-logo img { height: 50px; }
+            .label-overlay { top: 24px; right: 24px; }
+            .category-pill { padding: 6px 14px; font-size: 9px; letter-spacing: 1.5px; margin-bottom: 10px; }
+            .label-overlay h2 { font-size: 34px; }
+            .side-panel { width: min(100%, 390px); max-width: 390px; }
+            .modal-card { padding: 46px 32px 34px; gap: 18px; }
+            .location-line { font-size: 0.72rem; line-height: 1.45; padding-bottom: 14px; letter-spacing: 0.14em; }
+            .loc-name { font-size: 0.95rem; }
+            .loc-detail,
+            .loc-addr { font-size: 0.72rem; }
+            .modal-header h2 { font-size: 2.55rem; margin-bottom: 14px; }
+            .side-panel[data-cat="void"] .modal-header h2 { font-size: 2rem; }
+            .modal-header p { font-size: 0.84rem; line-height: 1.45; margin-top: 12px; }
+            .kpi-row { padding: 10px 0; }
+            .kpi-label { font-size: 0.66rem; line-height: 1.2; letter-spacing: 0.12em; }
+            .kpi-value { font-size: 1.8rem; }
+            .close-btn { top: 18px; right: 20px; font-size: 0.68rem; }
+            .legend { bottom: 22px; left: 20px; }
+            .legend-item-inner { padding: 4px 10px 4px 8px; gap: 7px; }
+            .legend-label { font-size: 8px; letter-spacing: 0.16em; }
+            .project-link { padding: 10px 18px; font-size: 8px; gap: 9px; }
+        }
+
+        @media (min-width: 769px) and (max-height: 560px) {
+            .krep-logo img { height: 42px; }
+            .label-overlay { display: none; }
+            .side-panel { width: min(100%, 350px); max-width: 350px; }
+            .modal-card { padding: 38px 26px 26px; gap: 14px; }
+            .modal-header h2 { font-size: 2.1rem; margin-bottom: 10px; }
+            .side-panel[data-cat="void"] .modal-header h2 { font-size: 1.75rem; }
+            .modal-header p { font-size: 0.78rem; line-height: 1.38; margin-top: 8px; }
+            .kpi-row { padding: 8px 0; }
+            .kpi-value { font-size: 1.45rem; }
+            .project-link { padding: 8px 14px; }
+        }
+
+        @media (max-width: 768px) and (max-height: 640px) {
+            .side-panel { height: 82vh; }
+            .modal-card { padding: 42px 24px 28px; gap: 16px; }
+            .modal-header h2 { font-size: 2.2rem; margin-bottom: 12px; }
+            .side-panel[data-cat="void"] .modal-header h2 { font-size: 1.8rem; }
+            .modal-header p { font-size: 0.84rem; line-height: 1.45; margin-top: 10px; }
+            .location-line { padding-bottom: 14px; }
+            .kpi-row { padding: 10px 0; }
+            .kpi-value { font-size: 1.8rem; }
+        }
+
+        /* ── LEGEND ───────────────────────────────────────────────────────────────── */
+        .legend {
+            position: fixed;
+            bottom: 36px;
+            left: 30px;
+            z-index: 1001;
+            display: flex;
+            flex-direction: column;
+            gap: 0;
+            pointer-events: none;
+            transition: transform 0.8s var(--bezier), opacity 0.5s ease;
+            will-change: transform, opacity;
+        }
+        body.panel-open .legend {
+            transform: translateX(calc(-100% - 30px));
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .legend-item {
+            display: flex; align-items: center;
+            pointer-events: all; cursor: pointer;
+            position: relative;
+        }
+
+        .legend-item-bar {
+            width: 2px;
+            align-self: stretch;
+            background: var(--legend-color);
+            transform: scaleY(0);
+            transform-origin: bottom center;
+            transition: transform 0.45s var(--bezier);
+            flex-shrink: 0;
+        }
+        .legend-item:hover .legend-item-bar,
+        .legend-item.is-active .legend-item-bar { transform: scaleY(1); }
+
+        .legend-item-inner {
+            display: flex; align-items: center; gap: 9px;
+            padding: 5px 12px 5px 10px;
+        }
+
+        .legend-dot {
+            width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+            opacity: 0.5;
+            transition: transform 0.4s var(--bezier), opacity 0.3s ease;
+        }
+        .legend-item:hover .legend-dot { opacity: 0.85; transform: scale(1.3); }
+        .legend-item.is-active .legend-dot { opacity: 1; transform: scale(1.4); }
+
+        .legend-label {
+            font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase;
+            color: var(--dark); opacity: 0.4;
+            transition: opacity 0.3s ease, letter-spacing 0.4s var(--bezier);
+            white-space: nowrap;
+        }
+        .legend-item:hover .legend-label { opacity: 0.75; }
+        .legend-item.is-active .legend-label { opacity: 1; letter-spacing: 0.25em; }
+
+        @media (max-width: 768px) {
+            .legend {
+                flex-direction: row;
+                bottom: 20px;
+                left: 50%;
+                transform: translateX(-50%);
+                gap: 6px;
+                align-items: center;
+                background: none;
+                border: none;
+            }
+            body.panel-open .legend {
+                transform: translateX(-50%) translateY(60px);
+                opacity: 0;
+            }
+            .legend-item {
+                flex-direction: column;
+                align-items: center;
+                gap: 4px;
+            }
+            .legend-item-bar {
+                width: 100%;
+                height: 1px;
+                align-self: auto;
+                transform: scaleX(0);
+                transform-origin: left center;
+                order: -1;
+            }
+            .legend-item:hover .legend-item-bar,
+            .legend-item.is-active .legend-item-bar { transform: scaleX(1); }
+
+            .legend-item-inner {
+                padding: 6px 8px 4px;
+                gap: 0;
+            }
+            .legend-label { display: none; }
+            .legend-dot { width: 9px; height: 9px; opacity: 0.55; }
+            .legend-item.is-active .legend-dot { opacity: 1; transform: scale(1.5); }
+        }
+
+        /* VLTAVA LAYER */
+        .vltava-shape {
+            cursor: pointer;
+            transition: fill-opacity 0.6s var(--bezier), stroke-width 0.6s var(--bezier), stroke 0.6s var(--bezier), opacity 0.7s var(--bezier);
+        }
+        body.panel-open .vltava-shape {
+            cursor: default;
+        }
+        body.is-filtering .vltava-shape {
+            opacity: 0.18;
+        }
+        body.is-filtering .vltava-shape.is-active-river {
+            opacity: 1 !important;
+            stroke: #7FD8F7 !important;
+            stroke-width: 2.5px !important;
+            animation: vltavaPulse 3s infinite ease-in-out;
+        }
+        @keyframes vltavaPulse {
+            0%, 100% { fill-opacity: 0.18; }
+            50%       { fill-opacity: 0.32; }
+        }
+
+        /* ── PARTNER DOTS ─────────────────────────────────────────────────────────── */
+        .partner-dot-marker { background: none; border: none; }
+        .partner-dot {
+            width: 8px; height: 8px;                        /* FIX 3: was 6px */
+            border-radius: 50%;
+            background: #9BAAB8;
+            opacity: 0.52;                                  /* FIX 3: was 0.38 */
+            border: 1px solid rgba(255,255,255,0.42);       /* FIX 3: added — reads on light & dark tiles */
+            box-shadow: 0 1px 3px rgba(0,0,0,0.13);        /* FIX 3: added — subtle lift */
+            transition: background 0.5s var(--bezier), opacity 0.5s var(--bezier), transform 0.5s var(--bezier), box-shadow 0.5s var(--bezier);
+            cursor: default;
+            pointer-events: none;
+        }
+        /* Active state — shown when parent category is selected */
+        .partner-dot.is-partner-active {
+            opacity: 0.82;                                  /* FIX 3: was 0.72 */
+            transform: scale(1.6);                          /* FIX 3: was 1.5 */
+            cursor: default;
+            pointer-events: all;
+        }
+        /* FIX 1: Plácky partners active — was rgba(239,113,84,0.25) (orange), now green */
+        .partner-dot.is-partner-active.partner-placky {
+            background: #7EC8A4;
+            box-shadow: 0 0 0 3px rgba(126,200,164,0.28);
+        }
+        /* Vltava partners active */
+        .partner-dot.is-partner-active.partner-river {
+            background: #7FD8F7;
+            box-shadow: 0 0 0 3px rgba(127,216,247,0.28);
+        }
+        /* When filtering is on, hide all partner dots that aren't active */
+        body.is-filtering .partner-dot:not(.is-partner-active) {
+            opacity: 0;
+        }
+        /* ── PROJECT LINK BUTTON ─────────────────────────────────────────────────── */
+        .project-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            align-self: flex-start;
+            padding: 14px 28px;
+            border: 1px solid var(--theme-fg);
+            color: var(--theme-fg);
+            text-decoration: none;
+            font-size: 9px;
+            letter-spacing: 0.25em;
+            text-transform: uppercase;
+            opacity: 0.9;
+            position: relative;
+            overflow: hidden;
+            transition: opacity 0.3s ease, color 0.45s var(--bezier);
+        }
+        .project-link::before {
+            content: '';
+            position: absolute; inset: 0;
+            background: var(--theme-fg);
+            transform: scaleX(0);
+            transform-origin: left;
+            transition: transform 0.5s var(--bezier);
+            z-index: 0;
+        }
+        .project-link:hover { opacity: 1; color: var(--theme-bg); }
+        .project-link:hover::before { transform: scaleX(1); }
+        .project-link span { position: relative; z-index: 1; }
+        .project-link .link-arrow {
+            position: relative; z-index: 1;
+            display: inline-block;
+            transition: transform 0.45s var(--bezier);
+            font-style: normal;
+        }
+        .project-link:hover .link-arrow { transform: translateX(5px); }
+
+        .project-link {
+            transform: translateY(16px);
+            opacity: 0;
+            transition: transform 0.7s var(--bezier), opacity 0.5s ease, color 0.45s var(--bezier);
+        }
+        .side-panel.active .project-link {
+            transform: translateY(0);
+            opacity: 0.9;
+            transition-delay: 0.5s;
+        }
+        .side-panel.active .project-link:hover { opacity: 1; }
+
+        @media (min-width: 769px) and (max-height: 720px), (min-width: 769px) and (max-width: 1100px) {
+            .legend { bottom: 22px; left: 20px; }
+            .legend-item-inner { padding: 4px 10px 4px 8px; gap: 7px; }
+            .legend-label { font-size: 8px; letter-spacing: 0.16em; }
+            .project-link { padding: 10px 18px; font-size: 8px; gap: 9px; }
+        }
+
+        @media (min-width: 769px) and (max-height: 560px) {
+            .project-link { padding: 8px 14px; }
+        }
+    </style>
+</head>
+<body>
+
+    <div id="error-overlay">
+        <h1>⚠ Chyba načítání dat</h1>
+        <p>Mapa nemůže být zobrazena. Chybí jeden nebo více datových souborů.<br>
+        Ujistěte se, že jsou všechny níže uvedené soubory ve stejné složce jako tento HTML soubor:</p>
+        <ul id="error-list"></ul>
+        <p>Po umístění souborů obnovte stránku.</p>
+    </div>
+
+    <div class="status-ui" id="status-bar"></div>
+
+    <!-- KREP logo — loads from same folder as the HTML file -->
+    <div class="krep-logo">
+        <a href="https://www.kreativnipraha.eu/cs" target="_blank" rel="noopener">
+            <img src="krep.svg" alt="KREP" draggable="false">
+        </a>
+    </div>
+
+    <div class="label-overlay" id="overlay">
+        <div class="category-pill" id="pill-text">Kategorie</div>
+        <h2 id="node-name"></h2>
+    </div>
+
+    <div id="map"></div>
+
+    <div class="legend" id="legend">
+        <div class="legend-item" data-cat="core" style="--legend-color:#2864A6">
+            <div class="legend-item-bar"></div>
+            <div class="legend-item-inner">
+                <div class="legend-dot" style="background:#2864A6"></div>
+                <span class="legend-label">Pražské židle a stolky</span>
+            </div>
+        </div>
+        <div class="legend-item" data-cat="pulse" style="--legend-color:#E8318B">
+            <div class="legend-item-bar"></div>
+            <div class="legend-item-inner">
+                <div class="legend-dot" style="background:#E8318B"></div>
+                <span class="legend-label">To je moje místo</span>
+            </div>
+        </div>
+        <div class="legend-item" data-cat="data" style="--legend-color:#7EC8A4">
+            <div class="legend-item-bar"></div>
+            <div class="legend-item-inner">
+                <div class="legend-dot" style="background:#7EC8A4"></div>
+                <span class="legend-label">Prážské Plácky</span>
+            </div>
+        </div>
+        <div class="legend-item" data-cat="void" style="--legend-color:#F19C8A">
+            <div class="legend-item-bar"></div>
+            <div class="legend-item-inner">
+                <div class="legend-dot" style="background:#F19C8A"></div>
+                <span class="legend-label">Konference</span>
+            </div>
+        </div>
+        <div class="legend-item" data-cat="river" style="--legend-color:#7FD8F7">
+            <div class="legend-item-bar"></div>
+            <div class="legend-item-inner">
+                <div class="legend-dot" style="background:#7FD8F7"></div>
+                <span class="legend-label">Poznej Vltavu</span>
+            </div>
+        </div>
+        <div class="legend-item" data-cat="kompas" style="--legend-color:#F9EC53">
+            <div class="legend-item-bar"></div>
+            <div class="legend-item-inner">
+                <div class="legend-dot" style="background:#F9EC53"></div>
+                <span class="legend-label">Kulturní Kompas</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="side-panel" id="side-panel">
+        <button class="close-btn" onclick="closePanel()">[ ESC ]</button>
+        <div class="modal-card">
+            <div class="modal-header">
+                <h2 id="panel-title"></h2>
+                <div class="location-line" id="panel-location" style="display:none"></div>
+                <p id="panel-desc"></p>
+            </div>
+            <div class="kpi-list" id="kpi-list">
+                <!-- rows injected dynamically by openPanel -->
+            </div>
+            <a id="panel-link" class="project-link" href="#" target="_blank" rel="noopener">
+                <span>Více o projektu</span>
+                <i class="link-arrow">→</i>
+            </a>
+        </div>
+    </div>
+
+    <script src="KREP_ZIDLE_STOLKY_9.js"></script>
+    <script src="KREP_TOJEMOJEMISTO_3.js"></script>
+    <script src="KREP_PLACKY_4.js"></script>
+    <script src="KREP_PLACKY_PARTNERI_5.js"></script>
+    <script src="KREP_KONFERENCE_7.js"></script>
+    <script src="FINALCONSOLIDATEDMC_1.js"></script>
+    <script src="KREP_VLTAVA_SPOLUPRACE_6.js"></script>
+    <script src="vltava_simplify_2.js"></script>
+    <script src="KREP_KOMPAS_8.js"></script>
+
+    <script src="js/config.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+    // ─── HELPER: escape HTML attributes ─────────────────────────────────────────
+    function escapeHtmlAttr(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    }
+
+    // ─── HELPER: get SVG path element from a Leaflet vector layer ───────────────
+    function getLayerElement(l) {
+        if (l._path) return l._path;
+        if (typeof l.getElement === 'function') return l.getElement();
+        return null;
+    }
+
+    function applyTheme(catData, DOM) {
+        document.documentElement.style.setProperty('--theme-bg', catData.bg);
+        document.documentElement.style.setProperty('--theme-fg', catData.fg);
+        DOM.panel.style.setProperty('--theme-bg', catData.bg);
+        DOM.panel.style.setProperty('--theme-fg', catData.fg);
+    }
+
+    // ─── SUFFIX-AGNOSTIC GLOBAL RESOLVER ─────────────────────────────────────────
+    function resolveGlobal(prefixes) {
+        const candidates = Array.isArray(prefixes) ? prefixes : [prefixes];
+        for (const prefix of candidates) {
+            if (prefix in window) return window[prefix];
+            const re = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '_\\d+$');
+            const match = Object.keys(window).find(k => re.test(k));
+            if (match) return window[match];
+        }
+        return undefined;
+    }
+
+    const REQUIRED = [
+        { prefix: ['json_KREP_ZIDLE_STOLKY', 'json_Zidle_2026'], label: 'KREP_ZIDLE_STOLKY_*.js' },
+        { prefix: 'json_KREP_TOJEMOJEMISTO',      label: 'KREP_TOJEMOJEMISTO_*.js'      },
+        { prefix: 'json_KREP_PLACKY',             label: 'KREP_PLACKY_*.js'             },
+        { prefix: 'json_KREP_PLACKY_PARTNERI',    label: 'KREP_PLACKY_PARTNERI_*.js'    },
+        { prefix: 'json_KREP_KONFERENCE',         label: 'KREP_KONFERENCE_*.js'         },
+        { prefix: 'json_FINALCONSOLIDATEDMC',     label: 'FINALCONSOLIDATEDMC_*.js'     },
+        { prefix: 'json_KREP_VLTAVA_SPOLUPRACE',  label: 'KREP_VLTAVA_SPOLUPRACE_*.js'  },
+        { prefix: 'json_vltava_simplify',         label: 'vltava_simplify_*.js'         },
+        { prefix: 'json_KREP_KOMPAS',             label: 'KREP_KOMPAS_*.js'             },
+    ];
+
+    const missing = REQUIRED.filter(d => resolveGlobal(d.prefix) === undefined);
+    if (missing.length > 0) {
+        const overlay = document.getElementById('error-overlay');
+        const list    = document.getElementById('error-list');
+        overlay.style.display = 'block';
+        REQUIRED.forEach(d => {
+            const li = document.createElement('li');
+            li.textContent = d.label;
+            li.className   = resolveGlobal(d.prefix) !== undefined ? 'ok' : '';
+            list.appendChild(li);
+        });
+        throw new Error('Missing datasets: ' + missing.map(d => d.label).join(', '));
+    }
+
+    const json_KREP_ZIDLE_STOLKY_7      = resolveGlobal(['json_KREP_ZIDLE_STOLKY', 'json_Zidle_2026']);
+    const json_KREP_TOJEMOJEMISTO_2     = resolveGlobal('json_KREP_TOJEMOJEMISTO');
+    const json_KREP_PLACKY_3            = resolveGlobal('json_KREP_PLACKY');
+    const json_KREP_PLACKY_PARTNERI_4   = resolveGlobal('json_KREP_PLACKY_PARTNERI');
+    const json_KREP_KONFERENCE_6        = resolveGlobal('json_KREP_KONFERENCE');
+    const json_FINALCONSOLIDATEDMC_8    = resolveGlobal('json_FINALCONSOLIDATEDMC');
+    const json_KREP_VLTAVA_SPOLUPRACE_5 = resolveGlobal('json_KREP_VLTAVA_SPOLUPRACE');
+    const json_vltava_simplify_1        = resolveGlobal('json_vltava_simplify');
+    const json_KREP_KOMPAS              = resolveGlobal('json_KREP_KOMPAS');
+
+    // ─── VLTAVA STATS ────────────────────────────────────────────────────────────
+    const vltavaFeatures = (json_KREP_VLTAVA_SPOLUPRACE_5.features || []);
+    const vltavaTotalCount = vltavaFeatures.length;
+    const vltavaZastitaCount = vltavaFeatures.filter(f => (f.properties.ROLE || '').trim() === 'Záštita').length;
+    const vltavaPartnerCount = vltavaFeatures.filter(f => (f.properties.ROLE || '').trim() === 'Partner').length;
+
+    // ─── COMPUTE STATS FROM DATA ─────────────────────────────────────────────────
+
+    const _zidleRaw = json_KREP_ZIDLE_STOLKY_7.features.filter(f => f.geometry);
+    const _zidleGrid = {};
+    _zidleRaw.forEach(f => {
+        const [lng, lat] = f.geometry.coordinates;
+        const key = lat.toFixed(2) + ',' + lng.toFixed(2);
+        if (!_zidleGrid[key] || f.properties.YEAR > _zidleGrid[key].properties.YEAR) {
+            _zidleGrid[key] = f;
+        }
+    });
+    const zidleFeatures = Object.values(_zidleGrid);
+    const zidleLocCount = _zidleRaw.length;
+
+    const mcFeatures = json_FINALCONSOLIDATEDMC_8.features;
+    const mcDistrictCount = mcFeatures.filter(f => f.properties.zidle_flag == 1).length;
+
+    const mistoFeatures = json_KREP_TOJEMOJEMISTO_2.features;
+    const mistoCount = mistoFeatures.length;
+
+    const plackyFeatures = json_KREP_PLACKY_3.features;
+    const plackyCount = plackyFeatures.length;
+    const partneriFeatures = json_KREP_PLACKY_PARTNERI_4.features;
+    const partneriCount = partneriFeatures.filter(f => f.geometry !== null).length;
+
+    const konfFeatures = json_KREP_KONFERENCE_6.features;
+    const konfCount = konfFeatures.filter(f => f.geometry).length;
+
+    const kompasFeatures = json_KREP_KOMPAS.features;
+    const kompasCount = kompasFeatures.length;
+
+    // ─── CATEGORY DEFINITIONS ────────────────────────────────────────────────────
+
+    const CATEGORIES = {
+        "core": {
+            name: "Židle\na stolky",
+            bg: "var(--color-core)", fg: "var(--color-highlight)", marker: "#2864A6",
+            pill: "Židle a stolky",
+            url: "https://www.kreativnipraha.eu/cs/projekty/verejny-prostor/prazske-zidle-a-stolky",
+            desc: "Zabydlujeme veřejný prostor v Praze praktickými židlemi a stolky již 11 let! Černý mobiliář s červeným logem Prahy najdete po celém městě. Oživuje náměstí, náplavky, ulice, parky, vnitrobloky či prostory před veřejnými budovami.",
+            kpis: [
+                { l: "Realizovaných zápůjček 2018–2026", v: "700+" },
+                { l: "Různých lokalit", v: String(zidleLocCount) },
+                { l: "Městských částí", v: String(mcDistrictCount) }
+            ]
+        },
+        "pulse": {
+            name: "To je\nmoje místo",
+            bg: "var(--color-pulse)", fg: "var(--color-highlight)", marker: "#E8318B",
+            pill: "To je moje místo",
+            url: "https://www.kreativnipraha.eu/cs/projekty/verejny-prostor/to-je-moje-misto",
+            desc: "Cílem projektu je oživit veřejný prostor prostřednictvím spolupráce různých sociálních skupin a kreativních intervencí. Výzva podporuje komunitní a umělecké projekty, které posilují lokální identitu, podporují zapojení obyvatel a přinášejí nové perspektivy na využití veřejného prostoru.",
+            kpis: [
+                { l: "Realizovaných projektů (2025)", v: String(mistoCount) },
+                { l: "", v: "" },
+                { l: "", v: "" },
+            ]
+        },
+        "data": {
+            name: "Pražské Plácky",
+            bg: "var(--color-data)", fg: "var(--color-core)", marker: "#7EC8A4",
+            pill: "Pražské Plácky",
+            url: "https://www.kreativnipraha.eu/cs/projekty/verejny-prostor/prazske-placky",
+            desc: "I drobné změny pomáhají budovat vztah lidí k místu, kde žijí, a nastartovat debatu o jeho rozvoji. Snažíme se kulturně obohatit vybrané místo pro všechny sociální, genderové i věkové skupiny. Podporujeme tak budování vztahu a zodpovědnosti za společně sdílený prostor.",
+            kpis: [
+                { l: "Realizovaných plácků", v: String(plackyCount) },
+                { l: "Partnerů při realizaci", v: String(partneriCount) },
+                { l: "", v: "" }
+            ]
+        },
+        "void": {
+            name: "Konference\na workshopy",
+            bg: "var(--color-void)", fg: "var(--color-core)", marker: "#F19C8A",
+            pill: "Konference a workshopy",
+            url: "https://www.kreativnipraha.eu/cs/projekty/konference-a-setkavani",
+            desc: "Jsme součástí několika evropských konsorcií, sítí a projektů, které se tak jako my věnují rozvoji prostředí pro kulturu. Zasazujeme se o sebevědomou a spolupracující kulturní obec, která sdílí vizi rozvoje. Skrze Pražské kulturní fórum – naši platformu pro diskusi a networking – formujeme kulturní prostředí nejen teoreticky, ale i prakticky. Jsme součástí New European Bauhaus a v Praze jsme hostili největší evropský summit KKO.",
+            kpis: [
+                { l: "Pořádaných konferencí a workshopů", v: String(konfCount) },
+                { l: "", v: "" },
+                { l: "", v: "" }
+            ]
+        },
+        "river": {
+            name: "POZNEJ\nVLTAVU",
+            bg: "var(--color-river)", fg: "var(--color-core)", marker: "#7FD8F7",
+            pill: "Festival",
+            url: "https://www.kreativnipraha.eu/cs/projekty/verejny-prostor/poznej-vltavu",
+            desc: "Poznej Vltavu je první městský festival svého druhu, který spojil kulturu, ekologii, vzdělávání i sport a otevřel Vltavu lidem napříč generacemi. Nepřístupná místa otevřela své brány 28.09.2025.",
+            kpis: [
+                { l: "Počet návštěvníků", v: "10 000+" },
+                { l: "Spolupracujících organizací", v: String(vltavaTotalCount) },
+                { l: "Z toho zaštiťujících", v: String(vltavaZastitaCount) },
+            ]
+        },
+        "kompas": {
+            name: "Kulturní KOMPAS",
+            bg: "var(--color-kompas)", fg: "var(--color-core)", marker: "#F9EC53",
+            pill: "Kulturní KOMPAS",
+            url: "https://www.kreativnipraha.eu/cs/projekty/verejny-prostor/kulturni-kompas",
+            desc: "Pomáháme městským částem zlepšovat podmínky pro místní kulturu. Nabízíme konzultace a příručku Kulturní KOMPAS. Politickým reprezentantům a úředníkům, kteří mají v gesci kulturu, spolkový život a sousedské vztahy, nabízíme sadu jednoduchých kroků, jak podpořit rozvoj kultury a komunitního života v jejich městské části.",
+            kpis: [
+                { l: "Počet podpor při implementaci", v: String(kompasFeatures.length) }
+            ]
+        }
+    };
+
+    // ─── BUILD POINTS ARRAY ───────────────────────────────────────────────────────
+
+    const POINTS = [];
+
+    zidleFeatures.forEach(f => {
+        if (!f.geometry) return;
+        const [lng, lat] = f.geometry.coordinates;
+        POINTS.push({
+            cat: "core",
+            pos: [lat, lng],
+            locationName: f.properties.LOKALITA,
+            locationDetail: f.properties.YEAR ? `Naposledy v roce ${f.properties.YEAR}` : null
+        });
+    });
+
+    mistoFeatures.forEach(f => {
+        if (!f.geometry) return;
+        const [lng, lat] = f.geometry.coordinates;
+        POINTS.push({
+            cat: "pulse",
+            pos: [lat, lng],
+            locationName: f.properties.NAZEV,
+            locationDetail: f.properties.ROK ? `Rok: ${f.properties.ROK}` : null,
+            address: f.properties.MC || null
+        });
+    });
+
+    plackyFeatures.forEach(f => {
+        if (!f.geometry) return;
+        const [lng, lat] = f.geometry.coordinates;
+        const fromYear = f.properties.FROM ? String(f.properties.FROM).slice(0, 4) : null;
+        POINTS.push({
+            cat: "data",
+            pos: [lat, lng],
+            locationName: f.properties.MISTO,
+            locationDetail: fromYear ? `Rok: ${fromYear}` : null,
+            address: f.properties.MC_NAZEV || null
+        });
+    });
+
+    konfFeatures.forEach(f => {
+        if (!f.geometry) return;
+        const [lng, lat] = f.geometry.coordinates;
+        // Build a clean date range string (YYYY-MM-DD → DD.MM.YYYY)
+        function fmtDate(d) {
+            if (!d) return null;
+            const parts = String(d).split('-');
+            if (parts.length === 3) return `${parts[2]}.${parts[1]}.${parts[0]}`;
+            return String(d);
+        }
+        const fromStr = fmtDate(f.properties.FROM);
+        const toStr   = fmtDate(f.properties.TO);
+        let dateStr = null;
+        if (fromStr && toStr && fromStr !== toStr) dateStr = `${fromStr} – ${toStr}`;
+        else if (fromStr) dateStr = fromStr;
+
+        // locationDetail shows subtitle; address line shows venue + date
+        const venueLine = [f.properties.PLACE, dateStr].filter(Boolean).join(' · ');
+        POINTS.push({
+            cat: "void",
+                pos: [lat, lng],
+                locationName: f.properties.NAME,
+                locationDetail: [f.properties.NAME_CZ, dateStr].filter(Boolean).join(' · ') || null,
+                address: f.properties.PLACE || null
+            });
+    });
+
+    kompasFeatures.forEach(f => {
+        if (!f.geometry) return;
+        const [lng, lat] = f.geometry.coordinates;
+
+        const rok = f.properties.ROK ? String(Math.round(f.properties.ROK)) : null;
+
+        POINTS.push({
+            cat: "kompas",
+            pos: [lat, lng],
+            locationName: f.properties.VYSTUP || null,
+            locationDetail: [f.properties.STANDARD, rok].filter(Boolean).join(' · ') || null,
+            address: f.properties.MC || null
+        });
+    });
+
+    // ─── DISTRICT FLAG CHECK ──────────────────────────────────────────────────────
+
+    function districtHasCategory(props, cat) {
+        if (cat === 'core')   return props.zidle_flag == 1;
+        if (cat === 'pulse')  return props.misto_flag == 1;
+        if (cat === 'data')   return props.placky_flag == 1;
+        if (cat === 'void')   return props.konf_flag == 1;
+        if (cat === 'kompas') return props.kompas_flag == 1;
+        return false;
+    }
+
+    // ─── POINT-IN-POLYGON ──────────────────────────────────────────────────────────
+
+    function pointInPolygon(pt, ring) {
+        let inside = false;
+        for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+            const xi = ring[i][0], yi = ring[i][1];
+            const xj = ring[j][0], yj = ring[j][1];
+            const intersect = ((yi > pt[1]) !== (yj > pt[1])) &&
+                (pt[0] < (xj - xi) * (pt[1] - yi) / (yj - yi) + xi);
+            if (intersect) inside = !inside;
+        }
+        return inside;
+    }
+
+    function pointInGeoJSONPolygon(pt, geometry) {
+        if (!geometry) return false;
+        const rings = geometry.type === 'Polygon'
+            ? geometry.coordinates
+            : geometry.type === 'MultiPolygon'
+                ? geometry.coordinates.flat(1)
+                : [];
+        if (!rings.length) return false;
+        return rings.some(ring => pointInPolygon(pt, ring));
+    }
+
+    const vltavaPartnerDistrictSet = new Set();
+    const vltavaPartnerPoints = (json_KREP_VLTAVA_SPOLUPRACE_5.features || [])
+        .filter(f => f.geometry && f.geometry.type === 'Point');
+
+    mcFeatures.forEach((mcf, idx) => {
+        if (!mcf.geometry) return;
+        for (const pf of vltavaPartnerPoints) {
+            if (pointInGeoJSONPolygon(pf.geometry.coordinates, mcf.geometry)) {
+                vltavaPartnerDistrictSet.add(idx);
+                break;
+            }
+        }
+    });
+
+    // ─── MAP INIT ─────────────────────────────────────────────────────────────────
+    // FIX 2C: Shared SVG renderer with tolerance — reduces vertex count recalculated per frame
+
+    // Compute initial bounds from FINALCONSOLIDATEDMC polygon extents
+    function mcBounds() {
+        let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+        (json_FINALCONSOLIDATEDMC_8.features || []).forEach(f => {
+            if (!f.geometry) return;
+            const rings = f.geometry.type === 'Polygon'
+                ? f.geometry.coordinates
+                : f.geometry.type === 'MultiPolygon'
+                    ? f.geometry.coordinates.flat(1)
+                    : [];
+            rings.forEach(ring => ring.forEach(([lng, lat]) => {
+                if (lat < minLat) minLat = lat;
+                if (lat > maxLat) maxLat = lat;
+                if (lng < minLng) minLng = lng;
+                if (lng > maxLng) maxLng = lng;
+            }));
+        });
+        return (minLat === Infinity)
+            ? L.latLngBounds([[50.0800, 14.4250], [50.0800, 14.4250]])
+            : L.latLngBounds([[minLat, minLng], [maxLat, maxLng]]);
+    }
+    const _mcBounds = mcBounds();
+    const _mcCenter = _mcBounds.getCenter();
+
+    const map = L.map('map', {
+        center: _mcCenter,
+        zoom: 12,
+        zoomControl: false,
+        preferCanvas: false,        // districts already use explicit canvas renderer; SVG for Vltava
+        zoomSnap: 0.0,
+        zoomDelta: 0.5,              // micro zoom steps for recording
+        wheelDebounceTime: 40,      // reduce scroll jank (default 40ms is fine, explicit for clarity)
+        tapTolerance: 15
+    });
+
+    // Fit initial view to the FINALCONSOLIDATEDMC polygon extent (Prague districts)
+    map.fitBounds(_mcBounds.pad(0.04), { animate: false });
+
+    // Robust initial view: when the page is embedded (iframe in a dashboard) or opened in a hidden
+    // tab, the container can have 0 size at init and the fit collapses to zoom 0 (world view).
+    // Re-fit on resize/load until the user first interacts.
+    let _userInteracted = false;
+    ['pointerdown', 'wheel', 'keydown', 'touchstart'].forEach(ev =>
+        document.addEventListener(ev, () => { _userInteracted = true; }, { once: true, passive: true, capture: true }));
+    function refitInitialView() {
+        if (_userInteracted) return;
+        map.invalidateSize({ animate: false });
+        if (map.getSize().x > 0 && map.getSize().y > 0) {
+            map.fitBounds(_mcBounds.pad(0.04), { animate: false });
+        }
+    }
+    map.on('resize', refitInitialView);
+    if (window.ResizeObserver) new ResizeObserver(refitInitialView).observe(map.getContainer());
+    window.addEventListener('load', refitInitialView);
+
+    // Tiles: no mid-zoom repaints, keep a buffer of pre-loaded tiles around viewport
+    L.tileLayer('https://basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}.png?key=' + encodeURIComponent(window.CARTO_API_KEY || ''), {
+        attribution: '© OpenStreetMap © CARTO',
+        updateWhenZooming: false,
+        updateWhenIdle: true,
+        keepBuffer: 3,
+        maxZoom: 19,
+        maxNativeZoom: 18,
+        detectRetina: true,
+        crossOrigin: true
+    }).addTo(map);
+
+    // ── PANES ────────────────────────────────────────────────────────────────────
+    // districtPane: Canvas-rendered polygons live here. Hidden during zoom so the
+    // browser doesn't reproject 57 polygons on every animation frame.
+    map.createPane('districtPane');
+    map.getPane('districtPane').style.zIndex = 390;  // below overlay (400) and vltava
+    map.getPane('districtPane').style.transition = 'opacity 0.15s ease';
+
+    map.createPane('zidlePane');
+    map.getPane('zidlePane').style.zIndex = 420;
+
+    map.createPane('vltavaPane');
+    map.getPane('vltavaPane').style.zIndex = 410;
+
+    // Canvas renderer exclusively for district polygons — all 57 districts draw
+    // into a single <canvas> bitmap instead of 57 individual <path> SVG elements.
+    // This is the primary fix: one canvas repaint vs. 57 DOM node reflows per frame.
+    const districtCanvas = L.canvas({ pane: 'districtPane', tolerance: 2 });
+
+    // Zoom: hide the district pane entirely during the animation, reveal after.
+    // The tiles carry the visual continuity — the districts snap back cleanly on zoomend.
+    // We also suppress pointer events on the whole map during zoom to stop hover
+    // recalculations firing on markers while they're mid-flight.
+    let _zoomHideTimer = null;
+    const districtPaneEl = map.getPane('districtPane');
+
+    const _mapEl = document.getElementById('map');
+
+    map.on('zoomstart', () => {
+        _mapEl.style.pointerEvents = 'none';
+        districtPaneEl.classList.add('zoom-hiding');
+        // Safety valve: if zoomend never fires (e.g. mobile interrupted), restore after 1.2s
+        clearTimeout(_zoomHideTimer);
+        _zoomHideTimer = setTimeout(() => {
+            districtPaneEl.classList.remove('zoom-hiding');
+            _mapEl.style.pointerEvents = '';
+        }, 1200);
+    });
+    map.on('zoomend', () => {
+        clearTimeout(_zoomHideTimer);
+        // Small rAF delay: let Leaflet finish repositioning paths before fading back in
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                districtPaneEl.classList.remove('zoom-hiding');
+                _mapEl.style.pointerEvents = '';
+            });
+        });
+    });
+
+    const DOM = {
+        body: document.body,
+        status: document.getElementById('status-bar'),
+        overlay: document.getElementById('overlay'),
+        nodeName: document.getElementById('node-name'),
+        pillText: document.getElementById('pill-text'),
+        panel: document.getElementById('side-panel'),
+        pTitle: document.getElementById('panel-title'),
+        pDesc: document.getElementById('panel-desc'),
+        pLocation: document.getElementById('panel-location'),
+        pLink: document.getElementById('panel-link'),
+        legendItems: Array.from(document.querySelectorAll('.legend-item')),
+        kpiList: document.getElementById('kpi-list')
+    };
+    const isMobile = () => window.innerWidth <= 768;
+
+    // ─── DISTRICT POLYGONS (Canvas) ───────────────────────────────────────────────
+    // All districts share ONE canvas renderer → one bitmap, one repaint per frame.
+    // Visual state (default / dimmed / active) is managed via setStyle() calls;
+    // CSS class toggling is gone because canvas layers have no DOM path elements.
+
+    const DISTRICT_STYLE_DEFAULT = {
+        color: '#2864A6', weight: 1, opacity: 1,
+        fillColor: '#2864A6', fillOpacity: 0.03,
+        fillRule: 'evenodd'
+    };
+    const DISTRICT_STYLE_DIM = {
+        color: '#2864A6', weight: 0.5, opacity: 0.25,
+        fillColor: '#2864A6', fillOpacity: 0.01,
+        fillRule: 'evenodd'
+    };
+    const DISTRICT_STYLE_ACTIVE = (strokeColor) => ({
+        color: strokeColor || '#2864A6', weight: 1.5, opacity: 0.7,
+        fillColor: '#F8EC81', fillOpacity: 0.28,
+        fillRule: 'evenodd'
+    });
+
+    const polygonLayers = [];   // { layer, props, idx, activeState: 'default'|'dim'|'active' }
+
+    mcFeatures.forEach((f, idx) => {
+        if (!f.geometry) return;
+        try {
+            const layer = L.geoJSON(f, {
+                renderer: districtCanvas,   // ← all share one canvas
+                pane: 'districtPane',
+                interactive: false,
+                smoothFactor: 1,            // minimal simplification — prevents topology slivers
+                style: { ...DISTRICT_STYLE_DEFAULT, fillRule: 'evenodd' }
+            }).addTo(map);
+
+            polygonLayers.push({ layer, props: f.properties, idx, activeState: 'default' });
+        } catch (e) {
+            console.warn('District polygon failed to render', f?.properties, e);
+        }
+    });
+
+    // Helper: batch-update all district styles (called from openPanel / closePanel)
+    // Wrapped in rAF so all setStyle calls land in the same frame → one canvas repaint.
+    function updateDistrictStyles(catId, markerColor) {
+        requestAnimationFrame(() => {
+            polygonLayers.forEach(({ layer, props, idx, activeState: prev }, i) => {
+                const active = catId
+                    ? (catId === 'river' ? vltavaPartnerDistrictSet.has(idx) : districtHasCategory(props, catId))
+                    : false;
+
+                const newState = catId === null ? 'default' : (active ? 'active' : 'dim');
+                if (newState === prev) return; // skip redundant setStyle calls
+                polygonLayers[i].activeState = newState;
+
+                const style = newState === 'active'
+                    ? DISTRICT_STYLE_ACTIVE(markerColor)
+                    : newState === 'dim'
+                        ? DISTRICT_STYLE_DIM
+                        : DISTRICT_STYLE_DEFAULT;
+
+                layer.setStyle(style);
+            });
+        });
+    }
+
+    // ─── VLTAVA POLYGON ───────────────────────────────────────────────────────────
+
+    let vltavaLayer = null;
+    let _vltavaClickPending = false;
+
+    const VLTAVA_STYLE_DEFAULT = {
+        color: '#2864A6',
+        weight: 1,
+        opacity: 0.22,
+        fillColor: '#7FD8F7',
+        fillOpacity: 0.10
+    };
+    const VLTAVA_STYLE_HOVER = {
+        color: '#7FD8F7',
+        weight: 2,
+        opacity: 0.9,
+        fillColor: '#7FD8F7',
+        fillOpacity: 0.22
+    };
+    const VLTAVA_STYLE_ACTIVE = {
+        color: '#7FD8F7',
+        weight: 2,
+        opacity: 0.9,
+        fillColor: '#7FD8F7',
+        fillOpacity: 0.18
+    };
+
+    try {
+        vltavaLayer = L.geoJSON(json_vltava_simplify_1, {
+            pane: 'vltavaPane',
+            smoothFactor: 3,         // FIX 2D: was 2
+            style: VLTAVA_STYLE_DEFAULT,
+            onEachFeature: function(feature, layer) {
+
+                layer.on('add', () => {
+                    if (layer._path) layer._path.classList.add('vltava-shape');
+                });
+
+                layer.on('mouseover', () => {
+                    const riverIsActive = DOM.panel.classList.contains('active') && DOM.panel.dataset.cat === 'river';
+                    if (!riverIsActive) {
+                        layer.setStyle(VLTAVA_STYLE_HOVER);
+                    }
+                    if (!isMobile() && !DOM.panel.classList.contains('active')) {
+                        const catData = CATEGORIES.river;
+                        DOM.status.style.background = catData.bg;
+                        applyTheme(catData, DOM);
+                        DOM.pillText.innerText = catData.pill;
+                        DOM.nodeName.innerText = 'Poznej Vltavu';
+                        DOM.overlay.classList.add('active');
+                    }
+                });
+
+                layer.on('mouseout', () => {
+                    const riverIsActive = DOM.panel.classList.contains('active') && DOM.panel.dataset.cat === 'river';
+                    if (!riverIsActive) {
+                        layer.setStyle(VLTAVA_STYLE_DEFAULT);
+                    }
+                    if (!isMobile() && !DOM.panel.classList.contains('active')) {
+                        _lastHoveredCat = null;
+                        _applyHoverState(null, null, null);
+                    }
+                });
+
+                layer.on('click', () => {
+                    if (DOM.panel.classList.contains('active')) return;
+                    _vltavaClickPending = true;
+                    layer.setStyle(VLTAVA_STYLE_ACTIVE);
+                    openRiverPanel();
+                });
+            }
+        }).addTo(map);
+
+        vltavaLayer.eachLayer(l => {
+            if (l._path) l._path.classList.add('vltava-shape');
+        });
+
+    } catch (e) {
+        console.warn('Vltava layer failed to render', e);
+    }
+
+    // ─── PARTNER DOTS ─────────────────────────────────────────────────────────────
+
+    const partnerMarkers = [];
+
+    function renderPartnerDots(features, catKey) {
+        features.forEach(f => {
+            if (!f.geometry) return;
+            const [lng, lat] = f.geometry.coordinates;
+            const subjekt = (f.properties.SUBJEKT || '').trim();
+
+            const dotHtml = `<div class="partner-dot partner-${catKey}" title="${escapeHtmlAttr(subjekt)}"></div>`;
+            const icon = L.divIcon({
+                className: 'partner-dot-marker',
+                html: dotHtml,
+                iconSize: [8, 8],       // FIX 3: was [6,6]
+                iconAnchor: [4, 4]      // FIX 3: was [3,3]
+            });
+            const marker = L.marker([lat, lng], { icon, interactive: false, zIndexOffset: -200 }).addTo(map);
+            partnerMarkers.push({ marker, catKey, subjekt });
+        });
+    }
+
+    renderPartnerDots(
+        (json_KREP_PLACKY_PARTNERI_4.features || []).filter(f => f.geometry),
+        'placky'
+    );
+    renderPartnerDots(
+        (json_KREP_VLTAVA_SPOLUPRACE_5.features || []).filter(f => f.geometry),
+        'river'
+    );
+
+    function activatePartnerDots(catKey) {
+        partnerMarkers.forEach(({ marker, catKey: k }) => {
+            const el = marker.getElement();
+            if (!el) return;
+            const dot = el.querySelector('.partner-dot');
+            if (!dot) return;
+            if (k === catKey) {
+                dot.classList.add('is-partner-active');
+                marker.options.interactive = true;
+                if (marker._icon) marker._icon.style.pointerEvents = 'all';
+            } else {
+                dot.classList.remove('is-partner-active');
+            }
+        });
+    }
+
+    function deactivatePartnerDots() {
+        partnerMarkers.forEach(({ marker }) => {
+            const el = marker.getElement();
+            if (!el) return;
+            const dot = el.querySelector('.partner-dot');
+            if (dot) dot.classList.remove('is-partner-active');
+            marker.options.interactive = false;
+            if (marker._icon) marker._icon.style.pointerEvents = 'none';
+        });
+    }
+
+    // ─── MARKERS ──────────────────────────────────────────────────────────────────
+
+    const OFFSET_DEG = 0.00032;
+
+    const groupedPoints = {};
+    POINTS.forEach(p => {
+        const key = `${p.pos[0].toFixed(4)},${p.pos[1].toFixed(4)}`;
+        if (!groupedPoints[key]) groupedPoints[key] = [];
+        groupedPoints[key].push(p);
+    });
+
+    Object.values(groupedPoints).forEach(group => {
+        const origin = group[0].pos;
+        const count  = group.length;
+
+        group.forEach((p, i) => {
+            let lat = origin[0];
+            let lng = origin[1];
+            if (count > 1) {
+                const angle = (2 * Math.PI / count) * i - Math.PI / 2;
+                lat = origin[0] + OFFSET_DEG * Math.cos(angle);
+                lng = origin[1] + OFFSET_DEG * Math.sin(angle) / Math.cos(origin[0] * Math.PI / 180);
+            }
+
+            const html = `
+                <div class="marker-wrapper">
+                    <div class="child-node cat-${p.cat}"
+                         data-cat="${escapeHtmlAttr(p.cat)}"
+                         data-lat="${escapeHtmlAttr(origin[0])}" data-lng="${escapeHtmlAttr(origin[1])}"
+                         data-name="${escapeHtmlAttr(p.locationName)}"
+                         data-detail="${escapeHtmlAttr(p.locationDetail)}"
+                         data-addr="${escapeHtmlAttr(p.address)}"
+                         style="--cat-color: ${CATEGORIES[p.cat].marker}">
+                        <div class="node-ring"></div>
+                        <span class="sonar-ring"></span>
+                        <span class="pulse-ring"></span>
+                        <div class="node-core"></div>
+                    </div>
+                </div>`;
+
+            const icon = L.divIcon({ className: 'custom-cluster', html, iconSize: [48, 48], iconAnchor: [24, 24] });
+            const isCoreOnly = p.cat === 'core';
+            const markerOpts = isCoreOnly ? { icon, pane: 'zidlePane' } : { icon };
+            const marker = L.marker([lat, lng], markerOpts).addTo(map);
+            const el = marker.getElement();
+            if (!el) return;
+
+            // marker element ready — delegated listeners handle interaction
+        });
+    });
+
+    // ─── DELEGATED HOVER: single listener on map container instead of per-marker ──
+    // Avoids attaching hundreds of listeners; uses event bubbling.
+
+    let _lastHoveredCat = null;
+    let _hoverRafId = null;
+
+    function _applyHoverState(catId, catData, locName) {
+        if (catId) {
+            DOM.status.style.background = catData.bg;
+            applyTheme(catData, DOM);
+            DOM.pillText.innerText = catData.pill;
+            // Re-trigger slide-up animation on every new location
+            DOM.overlay.classList.remove('active');
+            requestAnimationFrame(() => {
+                DOM.nodeName.innerText = locName || catData.name.replace('\n', ' ');
+                DOM.overlay.classList.add('active');
+            });
+        } else {
+            DOM.status.style.background = 'var(--dark)';
+            document.documentElement.style.setProperty('--theme-bg', 'var(--color-core)');
+            document.documentElement.style.setProperty('--theme-fg', 'var(--color-highlight)');
+            DOM.overlay.classList.remove('active');
+        }
+        _lastHoveredCat = catId;
+    }
+
+    document.getElementById('map').addEventListener('mouseover', (e) => {
+        if (isMobile() || DOM.panel.classList.contains('active')) return;
+        const child = e.target.closest('.child-node');
+        if (!child) return;
+        const catId = child.getAttribute('data-cat');
+        const catData = CATEGORIES[catId];
+        if (!catData) return;
+        if (_hoverRafId) cancelAnimationFrame(_hoverRafId);
+        _hoverRafId = requestAnimationFrame(() => {
+            _applyHoverState(catId, catData, child.getAttribute('data-name'));
+        });
+    }, { passive: true });
+
+    document.getElementById('map').addEventListener('mouseout', (e) => {
+        if (isMobile() || DOM.panel.classList.contains('active')) return;
+        const child = e.target.closest('.child-node');
+        if (!child) return;
+        // Only reset if not moving to another child-node
+        const to = e.relatedTarget ? e.relatedTarget.closest('.child-node') : null;
+        if (to) return;
+        if (_hoverRafId) cancelAnimationFrame(_hoverRafId);
+        _hoverRafId = requestAnimationFrame(() => {
+            _lastHoveredCat = null;
+            _applyHoverState(null, null, null);
+        });
+    }, { passive: true });
+
+    function stopLeafletMapClick(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (window.L && L.DomEvent) L.DomEvent.stop(e);
+    }
+
+    document.getElementById('map').addEventListener('click', (e) => {
+        const child = e.target.closest('.child-node');
+        if (!child) return;
+        const catId   = child.getAttribute('data-cat');
+        const activeCatId = DOM.panel.dataset.cat || null;
+
+        if (DOM.panel.classList.contains('active') && activeCatId && activeCatId !== catId) {
+            return;
+        }
+
+        stopLeafletMapClick(e);
+
+        const catData = CATEGORIES[catId];
+        const locName   = child.getAttribute('data-name');
+        const locDetail = child.getAttribute('data-detail');
+        const locAddr   = child.getAttribute('data-addr');
+        openPanel(catId, catData, locName, locDetail, locAddr, child);
+    }, { passive: false });
+
+    // ─── CACHED NODE LISTS for openPanel/closePanel performance ──────────────────
+    // querySelectorAll on every open/close is O(n) DOM walk; cache references once.
+    const _allMarkerWrappers = [];
+    const _childNodesByCat = {};  // catId → child DOM elements
+
+    // Populated after all markers are added (see end of marker loop)
+    function _buildMarkerCache() {
+        document.querySelectorAll('.marker-wrapper').forEach(w => _allMarkerWrappers.push(w));
+        document.querySelectorAll('.child-node').forEach(c => {
+            const cat = c.getAttribute('data-cat');
+            if (!_childNodesByCat[cat]) _childNodesByCat[cat] = [];
+            _childNodesByCat[cat].push(c);
+        });
+    }
+
+    _buildMarkerCache();
+
+    document.querySelectorAll('.legend-item[data-cat]').forEach(item => {
+        item.addEventListener('click', () => {
+            if (DOM.panel.classList.contains('active')) return; // must close panel first
+            const catId = item.getAttribute('data-cat');
+            if (catId) triggerCategoryFilter(catId);
+        });
+    });
+
+    // ─── PANEL LOGIC ──────────────────────────────────────────────────────────────
+
+        // ─── PANEL LOGIC ──────────────────────────────────────────────────────────────
+
+    function openPanel(catId, catData, locName, locDetail, locAddr, clickedChild) {
+        applyTheme(catData, DOM);
+        DOM.panel.dataset.cat = catId;
+
+        DOM.pTitle.replaceChildren();
+        catData.name.split('\n').forEach((part, index) => {
+            if (index > 0) DOM.pTitle.appendChild(document.createElement('br'));
+            DOM.pTitle.appendChild(document.createTextNode(part));
+        });
+
+        if (locName) {
+            DOM.pLocation.replaceChildren();
+
+            const nameEl = document.createElement('span');
+            nameEl.className = 'loc-name';
+            nameEl.textContent = locName;
+            DOM.pLocation.appendChild(nameEl);
+
+            if (locDetail) {
+                DOM.pLocation.appendChild(document.createElement('br'));
+                const detailEl = document.createElement('span');
+                detailEl.className = 'loc-detail';
+                detailEl.textContent = locDetail;
+                DOM.pLocation.appendChild(detailEl);
+            }
+
+            if (locAddr) {
+                DOM.pLocation.appendChild(document.createElement('br'));
+                const addrEl = document.createElement('span');
+                addrEl.className = 'loc-addr';
+                addrEl.textContent = locAddr;
+                DOM.pLocation.appendChild(addrEl);
+            }
+
+            DOM.pLocation.style.display = 'block';
+        } else {
+            DOM.pLocation.style.display = 'none';
+            DOM.pLocation.replaceChildren();
+        }
+
+        DOM.pDesc.innerText = catData.desc;
+        DOM.pLink.href = catData.url || '#';
+
+        // Render only KPI rows that have content — no empty lines, no orphan separators
+        const filledKpis = catData.kpis.filter(k => k.l || k.v);
+        DOM.kpiList.replaceChildren();
+        filledKpis.forEach((kpi, i) => {
+            const row = document.createElement('div');
+            row.className = 'kpi-row';
+
+            const labelMask = document.createElement('span');
+            labelMask.className = 'mask';
+            const label = document.createElement('div');
+            label.className = 'kpi-label';
+            label.style.transitionDelay = `${0.2 + i * 0.1}s`;
+            label.textContent = kpi.l;
+            labelMask.appendChild(label);
+
+            const valueMask = document.createElement('span');
+            valueMask.className = 'mask';
+            const value = document.createElement('div');
+            value.className = 'kpi-value';
+            value.style.transitionDelay = `${0.25 + i * 0.1}s`;
+            value.textContent = kpi.v;
+            valueMask.appendChild(value);
+
+            row.append(labelMask, valueMask);
+            DOM.kpiList.appendChild(row);
+        });
+
+        DOM.status.style.background = catData.bg;
+        DOM.overlay.classList.remove('active');
+        DOM.panel.classList.add('active');
+        // Ambient pulses self-expire via Web Animations API — no class cleanup needed
+
+        // Activate/deactivate partner dots BEFORE is-filtering is added to body.
+        // This ensures the correct dots already carry .is-partner-active when the
+        // CSS rule "body.is-filtering .partner-dot:not(.is-partner-active) { opacity:0 }"
+        // kicks in — preventing a 1-frame flicker where active dots are hidden first.
+        if (catId === 'data') {
+            activatePartnerDots('placky');
+        } else if (catId === 'river') {
+            activatePartnerDots('river');
+        } else {
+            deactivatePartnerDots();
+        }
+
+        DOM.body.classList.add('is-filtering');
+        DOM.body.classList.add('panel-open');
+        DOM.body.style.setProperty('--district-stroke', catData.marker);
+
+        DOM.legendItems.forEach(el => {
+            el.classList.toggle('is-active', el.getAttribute('data-cat') === catId);
+        });
+
+        // Use cached lists — avoids O(n) DOM walk on every panel open
+        _allMarkerWrappers.forEach(w => w.classList.remove('has-active'));
+        Object.values(_childNodesByCat).forEach(arr => arr.forEach(c => c.classList.remove('is-active-category')));
+
+        const activeChildren = _childNodesByCat[catId] || [];
+
+        // FIX: Batch GPU layer promotions across frames.
+        // Applying is-active-category (which triggers transform: scale()) to 200+
+        // elements synchronously forces the browser to allocate 200 GPU compositor
+        // layers in a single frame. Each new layer is initialised black, producing
+        // the flickering black pixel artifact at point boundaries.
+        // Chunking into rAF batches spreads the promotions over several frames so
+        // the compositor can initialise each layer before the next batch paints.
+        const BATCH_SIZE = 20;
+        let batchIdx = 0;
+        function applyNextBatch() {
+            const end = Math.min(batchIdx + BATCH_SIZE, activeChildren.length);
+            for (let i = batchIdx; i < end; i++) {
+                const matchingChild = activeChildren[i];
+                matchingChild.classList.add('is-active-category');
+                const wrapper = matchingChild.closest('.marker-wrapper');
+                if (wrapper) wrapper.classList.add('has-active');
+            }
+            batchIdx = end;
+            if (batchIdx < activeChildren.length) {
+                requestAnimationFrame(applyNextBatch);
+            }
+        }
+        requestAnimationFrame(applyNextBatch);
+
+        updateDistrictStyles(catId, catData.marker);
+
+        if (vltavaLayer) {
+            vltavaLayer.eachLayer(l => {
+                const el = getLayerElement(l);
+                if (!el) return;
+                if (catId === 'river') {
+                    el.classList.add('is-active-river');
+                    if (el.parentNode) el.parentNode.appendChild(el);
+                } else {
+                    el.classList.remove('is-active-river');
+                }
+            });
+        }
+
+        if (isMobile() && clickedChild) {
+            const lat = parseFloat(clickedChild.getAttribute('data-lat'));
+            const lng = parseFloat(clickedChild.getAttribute('data-lng'));
+            const pointPx = map.project([lat, lng]);
+            pointPx.y += (window.innerHeight * 0.35);
+            map.panTo(map.unproject(pointPx), { animate: true, duration: 0.8 });
+        }
+    }
+
+    function fitCategoryBounds(catId) {
+        const pts = POINTS.filter(p => p.cat === catId).map(p => p.pos);
+        if (!pts.length) return;
+        const bounds = L.latLngBounds(pts);
+        if (!bounds.isValid()) return;
+        map.fitBounds(bounds.pad(0.12), {
+            animate: true,
+            duration: 0.9,
+            paddingTopLeft: [40, 40],
+            paddingBottomRight: [isMobile() ? 40 : 520, 60]
+        });
+    }
+
+    function openRiverPanel() {
+        const catId = 'river';
+        const catData = CATEGORIES[catId];
+        openPanel(catId, catData, 'Festival', null, null, null);
+
+        if (vltavaLayer) {
+            vltavaLayer.setStyle(VLTAVA_STYLE_ACTIVE);
+        }
+    }
+
+    function triggerCategoryFilter(catId) {
+        if (catId === 'river') {
+            openRiverPanel();
+            return;
+        }
+        const catData = CATEGORIES[catId];
+        if (!catData) return;
+        openPanel(catId, catData, null, null, null, null);
+    }
+
+    function closePanel() {
+        DOM.panel.classList.remove('active');
+        DOM.panel.dataset.cat = '';
+        DOM.status.style.background = 'var(--dark)';
+        DOM.body.classList.remove('is-filtering');
+        DOM.body.classList.remove('panel-open');
+        DOM.body.style.removeProperty('--district-stroke');
+
+        DOM.legendItems.forEach(el => el.classList.remove('is-active'));
+
+        deactivatePartnerDots();
+
+        // Use cached lists
+        _allMarkerWrappers.forEach(w => w.classList.remove('has-active'));
+        Object.values(_childNodesByCat).forEach(arr => arr.forEach(c => c.classList.remove('is-active-category')));
+
+        updateDistrictStyles(null, null);
+
+        if (vltavaLayer) {
+            vltavaLayer.setStyle(VLTAVA_STYLE_DEFAULT);
+            vltavaLayer.eachLayer(l => {
+                const el = getLayerElement(l);
+                if (el) el.classList.remove('is-active-river');
+            });
+        }
+    }
+
+    map.on('click', () => {
+        if (_vltavaClickPending) {
+            _vltavaClickPending = false;
+            return;
+        }
+        if (DOM.panel.classList.contains('active')) closePanel();
+    });
+
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closePanel();
+    });
+
+    // ─── ANIMATION ENGINE ────────────────────────────────────────────────────────
+    // All ring animations (sonar + ambient pulse) run entirely through the
+    // Web Animations API. Zero CSS class toggling on animated properties.
+    // Zero pseudo-elements. Zero negative z-index. Zero GPU layer conflicts.
+
+    const SONAR_KEYFRAMES = [
+        { transform: 'translate3d(-50%,-50%,0) scale(1)',   opacity: 0.45 },
+        { transform: 'translate3d(-50%,-50%,0) scale(5)',   opacity: 0    }
+    ];
+    const SONAR_TIMING = { duration: 2800, iterations: Infinity, easing: 'ease-out' };
+
+    const PULSE_KEYFRAMES = [
+        { transform: 'translate3d(-50%,-50%,0) scale(0.8)', opacity: 0    },
+        { transform: 'translate3d(-50%,-50%,0) scale(1.1)', opacity: 0.48, offset: 0.15 },
+        { transform: 'translate3d(-50%,-50%,0) scale(3.8)', opacity: 0    }
+    ];
+    const PULSE_TIMING = { duration: 2200, iterations: 1, easing: 'ease-out', fill: 'forwards' };
+
+    // Track active Web Animation handles per ring element so we can cancel cleanly
+    const _sonarAnimations = new WeakMap();  // sonar-ring el → Animation
+    const _pulseAnimating   = new WeakSet(); // pulse-ring el → boolean flag
+
+    function startSonar(childNode) {
+        const ring = childNode.querySelector('.sonar-ring');
+        if (!ring || _sonarAnimations.has(ring)) return;
+        const anim = ring.animate(SONAR_KEYFRAMES, SONAR_TIMING);
+        _sonarAnimations.set(ring, anim);
+    }
+
+    function stopSonar(childNode) {
+        const ring = childNode.querySelector('.sonar-ring');
+        if (!ring) return;
+        const anim = _sonarAnimations.get(ring);
+        if (anim) { anim.cancel(); _sonarAnimations.delete(ring); }
+        // Hard-reset — guarantee no residual painted state
+        // Use translate3d to stay on the existing GPU compositing layer
+        ring.style.opacity = '0';
+        ring.style.transform = 'translate3d(-50%,-50%,0) scale(1)';
+    }
+
+    function firePulse(childNode) {
+        const ring = childNode.querySelector('.pulse-ring');
+        if (!ring || _pulseAnimating.has(ring)) return;
+        _pulseAnimating.add(ring);
+        const anim = ring.animate(PULSE_KEYFRAMES, PULSE_TIMING);
+        anim.onfinish = () => {
+            anim.cancel();
+            ring.style.opacity = '0';
+            ring.style.transform = 'translate3d(-50%,-50%,0) scale(0.8)';
+            _pulseAnimating.delete(ring);
+        };
+    }
+
+    // ─── SONAR: start/stop via openPanel / closePanel ────────────────────────────
+    // Patch openPanel to start sonar on active markers
+    const _origOpenPanel = openPanel;
+    // We hook into the existing active-category logic instead of monkey-patching:
+    // After _allMarkerWrappers loop in openPanel adds is-active-category, we start sonar.
+    // We do this by overriding the relevant section in closePanel/openPanel via event.
+
+    // Simpler: watch for is-active-category class changes using a MutationObserver
+    const _sonarObserver = new MutationObserver(mutations => {
+        mutations.forEach(m => {
+            if (m.type !== 'attributes' || m.attributeName !== 'class') return;
+            const el = m.target;
+            if (!el.classList.contains('child-node')) return;
+            if (el.classList.contains('is-active-category')) {
+                startSonar(el);
+            } else {
+                stopSonar(el);
+            }
+        });
+    });
+    // Observe all child-nodes (populated after markers are added)
+    document.querySelectorAll('.child-node').forEach(cn => {
+        _sonarObserver.observe(cn, { attributes: true });
+    });
+
+    // ─── AMBIENT PULSE: fire randomly when nothing is selected ───────────────────
+    (function startAmbientPulse() {
+        const _allChildNodes = Object.values(_childNodesByCat).flat();
+
+        function scheduleNext() {
+            setTimeout(fireRandomPulse, 700 + Math.random() * 900);
+        }
+
+        function fireRandomPulse() {
+            if (DOM.body.classList.contains('is-filtering')) { scheduleNext(); return; }
+
+            const pool = _allChildNodes.filter(n =>
+                !_pulseAnimating.has(n.querySelector('.pulse-ring'))
+            );
+            if (!pool.length) { scheduleNext(); return; }
+
+            const count = Math.min(pool.length, 2 + Math.round(Math.random()));
+            for (let i = 0; i < count; i++) {
+                const idx = Math.floor(Math.random() * pool.length);
+                const target = pool.splice(idx, 1)[0];
+                setTimeout(() => firePulse(target), i * 180);
+            }
+
+            scheduleNext();
+        }
+
+        setTimeout(scheduleNext, 2000);
+    })();
+    </script>
+</body>
+</html>
